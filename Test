@@ -1,43 +1,68 @@
 def serialize_tools(self, tools):
+    """
+    Convert MCP tools to Azure OpenAI function calling format.
+    
+    MCP format -> OpenAI format:
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_name",
+            "description": "tool description",
+            "parameters": {
+                "type": "object",
+                "properties": {...},
+                "required": [...]
+            }
+        }
+    }
+    """
     serialized = []
+    
     for tool in tools:
-        print("TOOLLLL", tool)
-        
         properties = {}
+        required = []
         
-        # Handle $defs case
-        if '$defs' in tool.inputSchema:
-            for key, value in tool.inputSchema['properties'].items():
+        # Extract properties from MCP tool inputSchema
+        input_schema = tool.inputSchema if hasattr(tool, 'inputSchema') else {}
+        
+        # Handle $defs case (JSON Schema references)
+        if '$defs' in input_schema:
+            for key, value in input_schema.get('properties', {}).items():
                 if '$ref' in value:
+                    # Resolve reference
                     ref_key = value['$ref'].split('/')[-1]
-                    if ref_key in tool.inputSchema['$defs']:
+                    if ref_key in input_schema['$defs']:
+                        ref_schema = input_schema['$defs'][ref_key]
                         properties[key] = {
-                            "type": tool.inputSchema['$defs'][ref_key].get('type', 'string'),
-                            "description": value.get('description') or key  # FIX: Never None
+                            "type": ref_schema.get('type', 'string'),
+                            "description": value.get('description') or ref_schema.get('description') or key
                         }
                 else:
                     properties[key] = {
                         "type": value.get('type', 'string'),
-                        "description": value.get('description') or key  # FIX: Never None
+                        "description": value.get('description') or key
                     }
         else:
-            # Original case
-            for key, value in tool.inputSchema.get('properties', {}).items():
+            # Direct properties without references
+            for key, value in input_schema.get('properties', {}).items():
                 properties[key] = {
                     "type": value.get('type', 'string'),
-                    "description": value.get('description') or key  # FIX: Never None
+                    "description": value.get('description') or key
                 }
         
-        # FIX: Add validation - Azure rejects None values
+        # Get required fields
+        required = input_schema.get('required', [])
+        
+        # Build OpenAI function calling format
         serialized_tool = {
             "type": "function",
             "function": {
-                "name": tool.name or "unknown_tool",  # FIX: Never None
-                "description": tool.description or f"Tool: {tool.name}",  # FIX: Never None
+                "name": tool.name if hasattr(tool, 'name') else "unknown_tool",
+                "description": tool.description if hasattr(tool, 'description') else f"Tool: {tool.name}",
                 "parameters": {
                     "type": "object",
-                    "properties": properties if properties else {},  # FIX: Never None
-                    "required": tool.inputSchema.get('required', [])  # FIX: Never None
+                    "properties": properties,
+                    "required": required
                 }
             }
         }
@@ -45,3 +70,85 @@ def serialize_tools(self, tools):
         serialized.append(serialized_tool)
     
     return serialized
+async def run_tool(self, function_name, function_args):
+    """
+    Execute tool via MCP and return result in OpenAI format
+    """
+    if not self.session:
+        raise RuntimeError("Not connected to MCP server")
+    
+    # Call MCP tool
+    result = await self.session.call_tool(
+        name=function_name,
+        arguments=function_args
+    )
+    
+    # MCP returns result with 'content' array
+    # Extract the actual result
+    if hasattr(result, 'content') and len(result.content) > 0:
+        # Get first content item (usually text)
+        content_item = result.content[0]
+        if hasattr(content_item, 'text'):
+            return content_item.text
+        return str(content_item)
+    
+    return str(result)
+
+
+
+async def get_response_stream(self, user_input, thread_id=None):
+    self.last_message = ""
+    self.messages += [{"role": "user", "content": user_input}]
+    
+    # Step 1: Connect to MCP server and get tools
+    self.tools = await self.get_tools()  # Returns MCP tools
+    
+    # Step 2: Convert MCP tools to OpenAI format
+    if self.tools and len(self.tools) > 0:
+        tools_serializable = self.serialize_tools(self.tools)
+        print(json.dumps(tools_serializable, indent=4))
+        
+        # Step 3: Send to Azure OpenAI with converted tools
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=self.messages,
+            temperature=self.temperature,
+            tools=tools_serializable,  # OpenAI format
+            tool_choice="auto"
+        )
+        
+        response_message = response.choices[0].message
+        tool_calls = response_message.tool_calls
+        
+        # Step 4: If model wants to call tools
+        if tool_calls:
+            self.messages.append(response_message)
+            
+            # Step 5: Execute each tool via MCP
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                function_args = json.loads(tool_call.function.arguments)
+                print(f"Calling MCP tool: {function_name} with args: {function_args}")
+                
+                # Execute via MCP
+                function_response = await self.run_tool(function_name, function_args)
+                
+                # Add tool result to messages
+                self.messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": function_name,
+                    "content": str(function_response)
+                })
+            
+            # Step 6: Get final response from model
+            final_response = self.client.chat.completions.create(
+                model=self.model,
+                messages=self.messages,
+                temperature=self.temperature
+            )
+            
+            return final_response.choices[0].message.content
+
+
+
