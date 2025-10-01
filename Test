@@ -70,29 +70,35 @@ def serialize_tools(self, tools):
         serialized.append(serialized_tool)
     
     return serialized
+
+async def get_all_tools(self):
+    """
+    Combine local actions with MCP tools
+    """
+    all_tools = []
+    
+    # 1. Get local actions (existing Nexus actions)
+    if self.actions:
+        all_tools.extend(self.actions)
+    
+    # 2. Get MCP tools from connected servers
+    if self.mcp_servers:
+        for mcp_server in self.mcp_servers:
+            mcp_tools = await self.fetch_mcp_tools(mcp_server)
+            all_tools.extend(mcp_tools)
+    
+    return all_tools
+
 async def run_tool(self, function_name, function_args):
     """
-    Execute tool via MCP and return result in OpenAI format
+    Check if tool is local or MCP and execute accordingly
     """
-    if not self.session:
-        raise RuntimeError("Not connected to MCP server")
+    # Check if it's a local action
+    if function_name in self.local_actions:
+        return self.local_actions[function_name](**function_args)
     
-    # Call MCP tool
-    result = await self.session.call_tool(
-        name=function_name,
-        arguments=function_args
-    )
-    
-    # MCP returns result with 'content' array
-    # Extract the actual result
-    if hasattr(result, 'content') and len(result.content) > 0:
-        # Get first content item (usually text)
-        content_item = result.content[0]
-        if hasattr(content_item, 'text'):
-            return content_item.text
-        return str(content_item)
-    
-    return str(result)
+    # Otherwise, execute via MCP
+    return await self.mcp_client.call_tool(function_name, function_args)
 
 
 
